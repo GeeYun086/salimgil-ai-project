@@ -1,0 +1,40 @@
+USE DATABASE sph_population_consumption_data;
+SHOW SCHEMAS;
+SHOW TABLES IN SCHEMA sph_population_consumption_data.GRANDATA;
+
+//카드 소비 테이블 확인
+DESC TABLE sph_population_consumption_data.GRANDATA.CARD_SALES_INFO;
+
+SELECT *
+FROM sph_population_consumption_data.GRANDATA.CARD_SALES_INFO
+LIMIT 10;
+
+//소득/자산 테이블 확인
+DESC TABLE sph_population_consumption_data.GRANDATA.ASSET_INCOME_INFO;
+
+SELECT *
+FROM sph_population_consumption_data.GRANDATA.ASSET_INCOME_INFO
+LIMIT 10;
+
+//유동인구 테이블 확인
+DESC TABLE sph_population_consumption_data.GRANDATA.FLOATING_POPULATION_INFO;
+
+SELECT *
+FROM sph_population_consumption_data.GRANDATA.FLOATING_POPULATION_INFO
+LIMIT 10;
+
+
+//SPH 구 코드 확인
+SELECT DISTINCT
+    PROVINCE_CODE,
+    CITY_CODE,
+    DISTRICT_CODE
+FROM SPH_POPULATION_CONSUMPTION_DATA.GRANDATA.CARD_SALES_INFO
+ORDER BY 1, 2, 3;
+
+SELECT DISTINCT
+    PROVINCE_CODE,
+    CITY_CODE,
+    DISTRICT_CODE
+FROM SPH_POPULATION_CONSUMPTION_DATA.GRANDATA.ASSET_INCOME_INFO
+ORDER BY 1, 2, 3;
