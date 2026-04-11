@@ -1,161 +1,204 @@
 USE DATABASE HACKATHON_DB;
 USE SCHEMA HACKATHON_DM;
 
-// JSON 출력형식 고정
-WITH base AS (
+//사용자 입력 기반 최종 결과 로직
+WITH user_input AS (
+    SELECT
+        '{{REGION_NAME}}' AS REGION_NAME,
+        '{{HOUSEHOLD_TYPE}}' AS HOUSEHOLD_TYPE,
+        '{{BUDGET_TIER}}' AS BUDGET_TIER,
+        '{{HAS_CHILD}}' AS HAS_CHILD,
+        '{{PRIORITY_FOCUS}}' AS PRIORITY_FOCUS
+),
+base AS (
     SELECT *
     FROM VW_LLM_PROFILE_INPUT
-    WHERE REGION_NAME = '서초구'
+    WHERE REGION_NAME = (SELECT REGION_NAME FROM user_input)
     ORDER BY YEAR_MONTH DESC
     LIMIT 1
 ),
-classification_raw AS (
-    SELECT
-        AI_COMPLETE(
-            model => 'claude-sonnet-4-5',
-            prompt => CONCAT(
-                '너는 개인화 이사 도우미 AI다. ',
-                '반드시 JSON으로만 답해라. ',
-                'household_type은 [1인가구형, 신혼/예비부부형, 육아가구형, 일반가족형] 중 하나다. ',
-                'budget_tier는 [BASIC, MID, PREMIUM] 중 하나다. ',
-                'reason은 한 문장으로 작성해라. ',
-                '지역명: ', COALESCE((SELECT REGION_NAME FROM base), '정보없음'), ', ',
-                '평균가구소득: ', COALESCE(TO_VARCHAR((SELECT AVG_HOUSEHOLD_INCOME FROM base)), '0'), ', ',
-                '평균자산: ', COALESCE(TO_VARCHAR((SELECT AVG_ASSET_AMOUNT FROM base)), '0'), ', ',
-                '영유아비율: ', COALESCE(TO_VARCHAR((SELECT AGE_UNDER5_PER_FEMALE_20TO40 FROM base)), '0'), ', ',
-                '가전가구소비: ', COALESCE(TO_VARCHAR((SELECT ELECTRONICS_FURNITURE_SALES FROM base)), '0'), ', ',
-                '식품소비: ', COALESCE(TO_VARCHAR((SELECT FOOD_SALES FROM base)), '0')
-            ),
-            model_parameters => {'temperature': 0},
-            response_format => {
-                'type': 'json',
-                'schema': {
-                    'type': 'object',
-                    'properties': {
-                        'household_type': {'type': 'string'},
-                        'budget_tier': {'type': 'string'},
-                        'reason': {'type': 'string'}
-                    },
-                    'required': ['household_type', 'budget_tier', 'reason']
-                }
-            },
-            return_error_details => TRUE
-        ) AS AI_RESULT
-),
 classification AS (
     SELECT
-        AI_RESULT:value:household_type::STRING AS HOUSEHOLD_TYPE,
-        AI_RESULT:value:budget_tier::STRING AS BUDGET_TIER,
-        AI_RESULT:value:reason::STRING AS CLASSIFICATION_REASON
-    FROM classification_raw
+        (SELECT HOUSEHOLD_TYPE FROM user_input) AS HOUSEHOLD_TYPE,
+        (SELECT BUDGET_TIER FROM user_input) AS BUDGET_TIER,
+        CONCAT(
+            '사용자 입력 기준 가구형태는 ',
+            (SELECT HOUSEHOLD_TYPE FROM user_input),
+            ', 예산등급은 ',
+            (SELECT BUDGET_TIER FROM user_input),
+            ', 자녀 여부는 ',
+            CASE WHEN (SELECT HAS_CHILD FROM user_input) = 'Y' THEN '있음' ELSE '없음' END,
+            '이며, 지역 ',
+            (SELECT REGION_NAME FROM user_input),
+            '의 최근 소비·소득 특성을 함께 반영했습니다.'
+        ) AS CLASSIFICATION_REASON
 ),
-strict_candidates AS (
+
+rental_base AS (
+    SELECT *
+    FROM VW_RENTAL_RECOMMENDATION_SCORE
+    WHERE REGION_NAME = (SELECT REGION_NAME FROM user_input)
+      AND YEAR_MONTH = (
+          SELECT MAX(YEAR_MONTH)
+          FROM VW_RENTAL_RECOMMENDATION_SCORE
+          WHERE REGION_NAME = (SELECT REGION_NAME FROM user_input)
+      )
+),
+rental_scored AS (
     SELECT
-        RULE_ID, ITEM_NAME, PRIORITY, ITEM_CATEGORY, IS_RENTAL_RELATED
-    FROM VW_CHECKLIST_RULE_STRICT
-    WHERE HOUSEHOLD_TYPE = (SELECT HOUSEHOLD_TYPE FROM classification)
-      AND BUDGET_TIER = (SELECT BUDGET_TIER FROM classification)
+        b.*,
+
+        CASE
+            WHEN (SELECT BUDGET_TIER FROM user_input) = 'BASIC' AND PRICE_LEVEL = 'LOW' THEN 30
+            WHEN (SELECT BUDGET_TIER FROM user_input) = 'BASIC' AND PRICE_LEVEL = 'MID' THEN 15
+            WHEN (SELECT BUDGET_TIER FROM user_input) = 'BASIC' AND PRICE_LEVEL = 'HIGH' THEN 5
+
+            WHEN (SELECT BUDGET_TIER FROM user_input) = 'MID' AND PRICE_LEVEL = 'LOW' THEN 20
+            WHEN (SELECT BUDGET_TIER FROM user_input) = 'MID' AND PRICE_LEVEL = 'MID' THEN 30
+            WHEN (SELECT BUDGET_TIER FROM user_input) = 'MID' AND PRICE_LEVEL = 'HIGH' THEN 15
+
+            WHEN (SELECT BUDGET_TIER FROM user_input) = 'PREMIUM' AND PRICE_LEVEL = 'LOW' THEN 10
+            WHEN (SELECT BUDGET_TIER FROM user_input) = 'PREMIUM' AND PRICE_LEVEL = 'MID' THEN 20
+            WHEN (SELECT BUDGET_TIER FROM user_input) = 'PREMIUM' AND PRICE_LEVEL = 'HIGH' THEN 30
+            ELSE 0
+        END AS BUDGET_SCORE,
+
+        CASE
+            WHEN (SELECT PRIORITY_FOCUS FROM user_input) = '위생/건강'
+                 AND RENTAL_SUB_CATEGORY IN ('정수기', '공기청정기', '비데') THEN 30
+            WHEN (SELECT PRIORITY_FOCUS FROM user_input) = '편의성'
+                 AND RENTAL_SUB_CATEGORY IN ('세탁기', '스타일러', '건조기') THEN 30
+            WHEN (SELECT PRIORITY_FOCUS FROM user_input) = '비용절감'
+                 AND RENTAL_SUB_CATEGORY IN ('정수기', '비데') THEN 20
+            WHEN (SELECT PRIORITY_FOCUS FROM user_input) = '육아/가족'
+                 AND RENTAL_SUB_CATEGORY IN ('정수기', '공기청정기', '세탁기') THEN 30
+            ELSE 5
+        END AS PRIORITY_SCORE,
+
+        CASE
+            WHEN (SELECT HAS_CHILD FROM user_input) = 'Y'
+                 AND RENTAL_SUB_CATEGORY IN ('정수기', '공기청정기', '세탁기') THEN 20
+            WHEN (SELECT HAS_CHILD FROM user_input) = 'N'
+                 AND RENTAL_SUB_CATEGORY IN ('비데', '공기청정기', '정수기') THEN 10
+            ELSE 0
+        END AS CHILD_SCORE
+    FROM rental_base b
 ),
-fallback_candidates AS (
+rental_final AS (
     SELECT
-        RULE_ID, ITEM_NAME, PRIORITY, ITEM_CATEGORY, IS_RENTAL_RELATED
-    FROM VW_CHECKLIST_RULE_STRICT
-    WHERE HOUSEHOLD_TYPE = (SELECT HOUSEHOLD_TYPE FROM classification)
+        *,
+        DEMAND_SCORE + BUDGET_SCORE + PRIORITY_SCORE + CHILD_SCORE AS FINAL_SCORE,
+        CASE
+            WHEN DEMAND_SCORE + BUDGET_SCORE + PRIORITY_SCORE + CHILD_SCORE >= 80 THEN '추천'
+            WHEN DEMAND_SCORE + BUDGET_SCORE + PRIORITY_SCORE + CHILD_SCORE >= 55 THEN '고려 가능'
+            ELSE '보류'
+        END AS RECOMMENDATION_LEVEL
+    FROM rental_scored
 ),
-selected_checklist AS (
-    SELECT * FROM strict_candidates
-    UNION ALL
-    SELECT * FROM fallback_candidates
-    WHERE NOT EXISTS (SELECT 1 FROM strict_candidates)
-),
-checklist_json AS (
-    SELECT
-        ARRAY_AGG(
-            OBJECT_CONSTRUCT(
-                'item_name', ITEM_NAME,
-                'priority', PRIORITY,
-                'category', ITEM_CATEGORY,
-                'is_rental_related', IS_RENTAL_RELATED
-            )
-        ) WITHIN GROUP (ORDER BY PRIORITY, RULE_ID) AS CHECKLIST
-    FROM selected_checklist
-),
-rental_pool AS (
-    SELECT
-        RENTAL_MAIN_CATEGORY,
-        RENTAL_SUB_CATEGORY,
-        AVG_NET_SALES,
-        AVG_POLICY_AMOUNT,
-        RN
-    FROM VW_LLM_RENTAL_CANDIDATES
-    WHERE REGION_ID = (SELECT REGION_ID FROM base)
-      AND YEAR_MONTH = (SELECT YEAR_MONTH FROM base)
-      AND RN <= 3
+rental_top AS (
+    SELECT *
+    FROM rental_final
+    ORDER BY FINAL_SCORE DESC, CONTRACT_COUNT DESC
+    LIMIT 5
 ),
 rental_candidates AS (
     SELECT
-        COALESCE(
-            LISTAGG(
-                CONCAT(
-                    COALESCE(RENTAL_MAIN_CATEGORY, ''), ' / ',
-                    COALESCE(RENTAL_SUB_CATEGORY, ''), ' / 평균계약금액지표:',
-                    COALESCE(TO_VARCHAR(AVG_NET_SALES), '0'), ' / 정책금액:',
-                    COALESCE(TO_VARCHAR(AVG_POLICY_AMOUNT), '0')
-                ),
-                '\n'
+        LISTAGG(
+            CONCAT(
+                RENTAL_SUB_CATEGORY,
+                ' / 대분류:', RENTAL_MAIN_CATEGORY,
+                ' / 추천단계:', RECOMMENDATION_LEVEL,
+                ' / 최종점수:', FINAL_SCORE,
+                ' / 계약수:', CONTRACT_COUNT,
+                ' / 참고가격:', AVG_NET_SALES
             ),
-            '렌탈 후보 없음'
+            '\n'
         ) AS RENTAL_CANDIDATES
-    FROM rental_pool
+    FROM rental_top
 ),
-rental_raw AS (
+rental_json AS (
+    SELECT
+        ARRAY_AGG(
+            OBJECT_CONSTRUCT(
+                'main_category', RENTAL_MAIN_CATEGORY,
+                'sub_category', RENTAL_SUB_CATEGORY,
+                'reference_price', AVG_NET_SALES,
+                'contract_count', CONTRACT_COUNT,
+                'demand_score', DEMAND_SCORE,
+                'budget_score', BUDGET_SCORE,
+                'priority_score', PRIORITY_SCORE,
+                'child_score', CHILD_SCORE,
+                'final_score', FINAL_SCORE,
+                'recommendation_level', RECOMMENDATION_LEVEL
+            )
+        ) WITHIN GROUP (ORDER BY FINAL_SCORE DESC, CONTRACT_COUNT DESC) AS RENTAL_RECOMMENDATIONS
+    FROM rental_top
+),
+
+checklist_raw AS (
     SELECT
         AI_COMPLETE(
             model => 'claude-sonnet-4-5',
             prompt => CONCAT(
-                '너는 렌탈가전 추천 AI다. ',
+                '너는 개인화 이사 준비 도우미 AI다. ',
                 '반드시 JSON으로만 답해라. ',
-                '아래 렌탈 후보 중에서만 최대 3개를 추천해라. ',
-                '반드시 후보에 없는 제품은 만들지 마라. ',
-                'reference_price는 월 렌탈료가 아니라 평균 계약 금액 기반 참고 지표다. ',
-                '각 항목마다 main_category, sub_category, reason, reference_price를 작성해라. ',
-                '분류 결과 household_type: ', COALESCE((SELECT HOUSEHOLD_TYPE FROM classification), '정보없음'), ', ',
-                'budget_tier: ', COALESCE((SELECT BUDGET_TIER FROM classification), '정보없음'), '. ',
-                '분류 사유: ', COALESCE((SELECT CLASSIFICATION_REASON FROM classification), '정보없음'), '. ',
-                '렌탈 후보: ',
-                COALESCE((SELECT RENTAL_CANDIDATES FROM rental_candidates), '후보 없음')
+                '체크리스트는 사용자의 실제 행동 계획이 되도록 구체적으로 작성해라. ',
+                '절대 너무 일반적인 표현만 반복하지 마라. ',
+                '반드시 다음 4개 stage만 사용해라: 지금 바로, 이사 전, 입주 직후, 선택 항목. ',
+                '각 항목은 stage, item_name, category, reason을 포함해야 한다. ',
+                '최대 10개 항목만 생성해라. ',
+                '사용자 입력과 지역 데이터 분석 결과, 렌탈 추천 분석 결과를 함께 반영해라. ',
+
+                '사용자 조건: ',
+                '지역=', COALESCE((SELECT REGION_NAME FROM user_input), '정보없음'), ', ',
+                '가구형태=', COALESCE((SELECT HOUSEHOLD_TYPE FROM user_input), '정보없음'), ', ',
+                '예산등급=', COALESCE((SELECT BUDGET_TIER FROM user_input), '정보없음'), ', ',
+                '자녀여부=', COALESCE((SELECT HAS_CHILD FROM user_input), '정보없음'), ', ',
+                '우선순위=', COALESCE((SELECT PRIORITY_FOCUS FROM user_input), '정보없음'), '. ',
+
+                '지역 분석 데이터: ',
+                '평균가구소득=', COALESCE(TO_VARCHAR((SELECT AVG_HOUSEHOLD_INCOME FROM base)), '0'), ', ',
+                '평균자산=', COALESCE(TO_VARCHAR((SELECT AVG_ASSET_AMOUNT FROM base)), '0'), ', ',
+                '식품소비=', COALESCE(TO_VARCHAR((SELECT FOOD_SALES FROM base)), '0'), ', ',
+                '생활서비스소비=', COALESCE(TO_VARCHAR((SELECT HOME_LIFE_SERVICE_SALES FROM base)), '0'), ', ',
+                '가전가구소비=', COALESCE(TO_VARCHAR((SELECT ELECTRONICS_FURNITURE_SALES FROM base)), '0'), ', ',
+                '이커머스소비=', COALESCE(TO_VARCHAR((SELECT E_COMMERCE_SALES FROM base)), '0'), '. ',
+
+                '렌탈 분석 결과: ',
+                COALESCE((SELECT RENTAL_CANDIDATES FROM rental_candidates), '없음'), '. '
             ),
-            model_parameters => {'temperature': 0},
+            model_parameters => {'temperature': 0.2},
             response_format => {
                 'type': 'json',
                 'schema': {
                     'type': 'object',
                     'properties': {
-                        'rental_recommendations': {
+                        'checklist': {
                             'type': 'array',
                             'items': {
                                 'type': 'object',
                                 'properties': {
-                                    'main_category': {'type': 'string'},
-                                    'sub_category': {'type': 'string'},
-                                    'reason': {'type': 'string'},
-                                    'reference_price': {'type': 'number'}
+                                    'stage': {'type': 'string'},
+                                    'item_name': {'type': 'string'},
+                                    'category': {'type': 'string'},
+                                    'reason': {'type': 'string'}
                                 },
-                                'required': ['main_category', 'sub_category', 'reason', 'reference_price']
+                                'required': ['stage', 'item_name', 'category', 'reason']
                             }
                         }
                     },
-                    'required': ['rental_recommendations']
+                    'required': ['checklist']
                 }
             },
             return_error_details => TRUE
         ) AS AI_RESULT
 ),
-rental_json AS (
+checklist_json AS (
     SELECT
-        AI_RESULT:value:rental_recommendations AS RENTAL_RECOMMENDATIONS
-    FROM rental_raw
+        AI_RESULT:value:checklist AS CHECKLIST
+    FROM checklist_raw
 )
+
 SELECT
     OBJECT_CONSTRUCT(
         'household_type', (SELECT HOUSEHOLD_TYPE FROM classification),

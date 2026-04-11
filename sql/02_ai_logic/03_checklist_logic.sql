@@ -1,83 +1,103 @@
 USE DATABASE HACKATHON_DB;
 USE SCHEMA HACKATHON_DM;
 
-// 체크리스트 추천 쿼리 (fallback, llm 대신 sql에서 후보 정해지도록 수정 적용)
-WITH base AS (
+//체크리스트 추천 로직
+//기존 룰 테이블 기반 추천 대신, 사용자 입력 + 지역 분석 + 렌탈 분석 결과를 넣고 LLM이 체크리스트를 생성하는 최종 버전
+WITH user_input AS (
+    SELECT
+        '{{REGION_NAME}}' AS REGION_NAME,
+        '{{HOUSEHOLD_TYPE}}' AS HOUSEHOLD_TYPE,
+        '{{BUDGET_TIER}}' AS BUDGET_TIER,
+        '{{HAS_CHILD}}' AS HAS_CHILD,
+        '{{PRIORITY_FOCUS}}' AS PRIORITY_FOCUS
+),
+base AS (
     SELECT *
     FROM VW_LLM_PROFILE_INPUT
-    WHERE REGION_NAME = '서초구'
+    WHERE REGION_NAME = (SELECT REGION_NAME FROM user_input)
     ORDER BY YEAR_MONTH DESC
     LIMIT 1
 ),
-classification_raw AS (
+rental_candidates AS (
+    SELECT
+        LISTAGG(
+            CONCAT(
+                RENTAL_SUB_CATEGORY,
+                ' / 대분류:', RENTAL_MAIN_CATEGORY,
+                ' / 계약수:', CONTRACT_COUNT,
+                ' / 참고가격:', AVG_NET_SALES
+            ),
+            '\n'
+        ) AS RENTAL_CANDIDATES
+    FROM VW_RENTAL_RECOMMENDATION_SCORE
+    WHERE REGION_NAME = (SELECT REGION_NAME FROM user_input)
+      AND YEAR_MONTH = (
+          SELECT MAX(YEAR_MONTH)
+          FROM VW_RENTAL_RECOMMENDATION_SCORE
+          WHERE REGION_NAME = (SELECT REGION_NAME FROM user_input)
+      )
+),
+checklist_raw AS (
     SELECT
         AI_COMPLETE(
             model => 'claude-sonnet-4-5',
             prompt => CONCAT(
-                '너는 개인화 이사 도우미 AI다. ',
+                '너는 개인화 이사 준비 도우미 AI다. ',
                 '반드시 JSON으로만 답해라. ',
-                'household_type은 [1인가구형, 신혼/예비부부형, 육아가구형, 일반가족형] 중 하나다. ',
-                'budget_tier는 [BASIC, MID, PREMIUM] 중 하나다. ',
-                'reason은 한 문장으로 작성해라. ',
-                '지역명: ', COALESCE((SELECT REGION_NAME FROM base), '정보없음'), ', ',
-                '평균가구소득: ', COALESCE(TO_VARCHAR((SELECT AVG_HOUSEHOLD_INCOME FROM base)), '0'), ', ',
-                '평균자산: ', COALESCE(TO_VARCHAR((SELECT AVG_ASSET_AMOUNT FROM base)), '0'), ', ',
-                '영유아비율: ', COALESCE(TO_VARCHAR((SELECT AGE_UNDER5_PER_FEMALE_20TO40 FROM base)), '0'), ', ',
-                '가전가구소비: ', COALESCE(TO_VARCHAR((SELECT ELECTRONICS_FURNITURE_SALES FROM base)), '0'), ', ',
-                '식품소비: ', COALESCE(TO_VARCHAR((SELECT FOOD_SALES FROM base)), '0')
+                '체크리스트는 사용자의 실제 행동 계획이 되도록 구체적으로 작성해라. ',
+                '절대 너무 일반적인 표현만 반복하지 마라. ',
+                '반드시 다음 4개 stage만 사용해라: 지금 바로, 이사 전, 입주 직후, 선택 항목. ',
+                '각 항목은 stage, item_name, category, reason을 포함해야 한다. ',
+                '최대 10개 항목만 생성해라. ',
+
+                '사용자 조건: ',
+                '지역=', COALESCE((SELECT REGION_NAME FROM user_input), '정보없음'), ', ',
+                '가구형태=', COALESCE((SELECT HOUSEHOLD_TYPE FROM user_input), '정보없음'), ', ',
+                '예산등급=', COALESCE((SELECT BUDGET_TIER FROM user_input), '정보없음'), ', ',
+                '자녀여부=', COALESCE((SELECT HAS_CHILD FROM user_input), '정보없음'), ', ',
+                '우선순위=', COALESCE((SELECT PRIORITY_FOCUS FROM user_input), '정보없음'), '. ',
+
+                '지역 분석 데이터: ',
+                '평균가구소득=', COALESCE(TO_VARCHAR((SELECT AVG_HOUSEHOLD_INCOME FROM base)), '0'), ', ',
+                '평균자산=', COALESCE(TO_VARCHAR((SELECT AVG_ASSET_AMOUNT FROM base)), '0'), ', ',
+                '식품소비=', COALESCE(TO_VARCHAR((SELECT FOOD_SALES FROM base)), '0'), ', ',
+                '생활서비스소비=', COALESCE(TO_VARCHAR((SELECT HOME_LIFE_SERVICE_SALES FROM base)), '0'), ', ',
+                '가전가구소비=', COALESCE(TO_VARCHAR((SELECT ELECTRONICS_FURNITURE_SALES FROM base)), '0'), ', ',
+                '이커머스소비=', COALESCE(TO_VARCHAR((SELECT E_COMMERCE_SALES FROM base)), '0'), '. ',
+
+                '렌탈 분석 결과: ',
+                COALESCE((SELECT RENTAL_CANDIDATES FROM rental_candidates), '없음'), '. ',
+
+                '출력 예시는 다음 형식이어야 한다: ',
+                '{"checklist":[{"stage":"지금 바로","item_name":"...","category":"...","reason":"..."}]}'
             ),
-            model_parameters => {'temperature': 0},
+            model_parameters => {'temperature': 0.2},
             response_format => {
                 'type': 'json',
                 'schema': {
                     'type': 'object',
                     'properties': {
-                        'household_type': {'type': 'string'},
-                        'budget_tier': {'type': 'string'},
-                        'reason': {'type': 'string'}
+                        'checklist': {
+                            'type': 'array',
+                            'items': {
+                                'type': 'object',
+                                'properties': {
+                                    'stage': {'type': 'string'},
+                                    'item_name': {'type': 'string'},
+                                    'category': {'type': 'string'},
+                                    'reason': {'type': 'string'}
+                                },
+                                'required': ['stage', 'item_name', 'category', 'reason']
+                            }
+                        }
                     },
-                    'required': ['household_type', 'budget_tier', 'reason']
+                    'required': ['checklist']
                 }
             },
             return_error_details => TRUE
         ) AS AI_RESULT
-),
-classification AS (
-    SELECT
-        AI_RESULT:value:household_type::STRING AS HOUSEHOLD_TYPE,
-        AI_RESULT:value:budget_tier::STRING AS BUDGET_TIER,
-        AI_RESULT:value:reason::STRING AS CLASSIFICATION_REASON
-    FROM classification_raw
-),
-strict_candidates AS (
-    SELECT
-        RULE_ID, ITEM_NAME, PRIORITY, ITEM_CATEGORY, IS_RENTAL_RELATED
-    FROM VW_CHECKLIST_RULE_STRICT
-    WHERE HOUSEHOLD_TYPE = (SELECT HOUSEHOLD_TYPE FROM classification)
-      AND BUDGET_TIER = (SELECT BUDGET_TIER FROM classification)
-),
-fallback_candidates AS (
-    SELECT
-        RULE_ID, ITEM_NAME, PRIORITY, ITEM_CATEGORY, IS_RENTAL_RELATED
-    FROM VW_CHECKLIST_RULE_STRICT
-    WHERE HOUSEHOLD_TYPE = (SELECT HOUSEHOLD_TYPE FROM classification)
-),
-selected_candidates AS (
-    SELECT * FROM strict_candidates
-    UNION ALL
-    SELECT * FROM fallback_candidates
-    WHERE NOT EXISTS (SELECT 1 FROM strict_candidates)
 )
 SELECT
-    (SELECT HOUSEHOLD_TYPE FROM classification) AS HOUSEHOLD_TYPE,
-    (SELECT BUDGET_TIER FROM classification) AS BUDGET_TIER,
-    (SELECT CLASSIFICATION_REASON FROM classification) AS CLASSIFICATION_REASON,
-    ARRAY_AGG(
-        OBJECT_CONSTRUCT(
-            'item_name', ITEM_NAME,
-            'priority', PRIORITY,
-            'category', ITEM_CATEGORY,
-            'is_rental_related', IS_RENTAL_RELATED
-        )
-    ) WITHIN GROUP (ORDER BY PRIORITY, RULE_ID) AS CHECKLIST_JSON
-FROM selected_candidates;
+    AI_RESULT:value:checklist AS CHECKLIST_JSON,
+    AI_RESULT:error AS ERROR_INFO
+FROM checklist_raw;
