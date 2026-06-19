@@ -1,4 +1,4 @@
-# 살림길
+# 🏠 살림길
 
 > **Snowflake AI & Data Hackathon 2026 Korea** 참가작
 > 🔗 [해커톤 공식 페이지](https://www.snowflake.com/snowflake-hackathon-2026-korea/)
